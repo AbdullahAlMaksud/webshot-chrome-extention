@@ -4,6 +4,36 @@ importScripts('editor/storage.js');
 // Helper to delay
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Rate-limiting state for Chrome captureVisibleTab quota
+// Chrome allows max 2 calls per second (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND)
+let lastCaptureTime = 0;
+const MIN_CAPTURE_INTERVAL_MS = 600; // 600ms ensures <= 1.66 calls/sec
+
+async function safeCaptureVisibleTab(windowId, options = { format: 'png' }, maxRetries = 5) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const elapsed = Date.now() - lastCaptureTime;
+    if (elapsed < MIN_CAPTURE_INTERVAL_MS) {
+      await sleep(MIN_CAPTURE_INTERVAL_MS - elapsed);
+    }
+
+    try {
+      lastCaptureTime = Date.now();
+      return await chrome.tabs.captureVisibleTab(windowId, options);
+    } catch (err) {
+      const isQuota = err.message && (
+        err.message.includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND') ||
+        err.message.includes('quota')
+      );
+      if (isQuota && attempt < maxRetries - 1) {
+        console.warn(`Capture quota hit, backing off and retrying (attempt ${attempt + 1}/${maxRetries})...`);
+        await sleep(750 * (attempt + 1));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // Ensure content script is injected into tab
 async function ensureContentScript(tabId) {
   try {
@@ -74,11 +104,11 @@ async function captureFullPage(tab) {
         percent: percent
       }).catch(() => {});
 
-      // Settle delay
-      await sleep(150);
+      // Settle delay for animations & lazy rendering
+      await sleep(200);
 
-      // Capture visible tab
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+      // Rate-limited capture with automatic retry & backoff
+      const dataUrl = await safeCaptureVisibleTab(tab.windowId, { format: 'png' });
 
       // Determine slice parameters
       if (isLastStep && totalSteps > 1) {
@@ -140,7 +170,7 @@ async function captureVisible(tab) {
     throw new Error('Chrome does not allow capturing internal browser or Web Store pages.');
   }
 
-  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+  const dataUrl = await safeCaptureVisibleTab(tab.windowId, { format: 'png' });
   const captureId = 'ws_' + Date.now();
 
   await WebShotStorage.saveCapture({
@@ -168,8 +198,8 @@ async function startAreaCapture(tab) {
 }
 
 async function handleAreaSelected(tab, area) {
-  await sleep(100);
-  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+  await sleep(150);
+  const dataUrl = await safeCaptureVisibleTab(tab.windowId, { format: 'png' });
   const captureId = 'ws_' + Date.now();
 
   await WebShotStorage.saveCapture({
